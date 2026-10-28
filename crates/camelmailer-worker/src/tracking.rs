@@ -13,6 +13,34 @@
 //! each tracked mail, and `href=3D"…"` links were never rewritten at all.
 //! Everything outside that one part — other parts, attachments, line
 //! endings — is left byte-for-byte as it was.
+//!
+//! Which of the two techniques run is decided per mail server by its
+//! `track_opens` and `track_clicks` flags ([`TrackingFlags`]).
+
+/// The tracking a message gets, from its server's `track_opens` and
+/// `track_clicks` flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrackingFlags {
+    pub opens: bool,
+    pub clicks: bool,
+}
+
+impl TrackingFlags {
+    /// The flags of a server; no server (missing, or the lookup failed) means
+    /// no tracking at all, so a lookup problem never adds tracking the
+    /// operator did not ask for.
+    pub fn for_server(server: Option<&camelmailer_core::Server>) -> Self {
+        server.map_or_else(Self::default, |server| Self {
+            opens: server.track_opens,
+            clicks: server.track_clicks,
+        })
+    }
+
+    /// True when at least one technique is enabled.
+    pub fn any(self) -> bool {
+        self.opens || self.clicks
+    }
+}
 
 /// Returns the byte offset of the body separator (the empty line) so callers
 /// can split headers from body.
@@ -463,6 +491,40 @@ pub fn with_html(raw_message: &[u8], html: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tracking_flags_follow_the_server_and_fail_closed_without_one() {
+        let mut server = camelmailer_core::testing::Fixtures::new().server().clone();
+        assert_eq!(TrackingFlags::for_server(None), TrackingFlags::default());
+        assert!(!TrackingFlags::for_server(None).any());
+
+        server.track_opens = false;
+        server.track_clicks = false;
+        assert!(!TrackingFlags::for_server(Some(&server)).any());
+
+        server.track_opens = true;
+        let flags = TrackingFlags::for_server(Some(&server));
+        assert_eq!(
+            flags,
+            TrackingFlags {
+                opens: true,
+                clicks: false
+            }
+        );
+        assert!(flags.any());
+
+        server.track_opens = false;
+        server.track_clicks = true;
+        let flags = TrackingFlags::for_server(Some(&server));
+        assert_eq!(
+            flags,
+            TrackingFlags {
+                opens: false,
+                clicks: true
+            }
+        );
+        assert!(flags.any());
+    }
 
     #[test]
     fn rewrites_http_links_and_leaves_others() {

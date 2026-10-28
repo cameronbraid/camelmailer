@@ -2503,6 +2503,151 @@ fn html_outgoing(server_id: camelmailer_core::Id) -> QueuedMessage {
     message
 }
 
+/// Set the server's per-server tracking flags. New servers default to both
+/// off, so every test that expects tracking has to opt in.
+async fn set_tracking(s: &Setup, opens: bool, clicks: bool) {
+    let mut server = s.server.clone();
+    server.track_opens = opens;
+    server.track_clicks = clicks;
+    s.store.update_server(server).await.unwrap();
+}
+
+/// The `(click, open)` tracking tokens the worker registered for a message.
+/// `tracking_tokens` is the cross-tenant lookup table, so no RLS context.
+async fn tracking_token_counts(s: &Setup, message_id: i64) -> (i64, i64) {
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE kind = 'click'),
+                count(*) FILTER (WHERE kind = 'open')
+         FROM tracking_tokens WHERE message_id = $1",
+    )
+    .bind(message_id)
+    .fetch_one(s.store.pool())
+    .await
+    .unwrap();
+    row
+}
+
+/// The DATA lines the mock relay received, without the message-token
+/// header the worker always prepends.
+fn delivered_data_lines(smtp: &MockSmtp) -> Vec<String> {
+    let seen = smtp.received.lock().unwrap().clone();
+    let start = seen
+        .iter()
+        .position(|line| line.eq_ignore_ascii_case("DATA"))
+        .expect("DATA command")
+        + 1;
+    let end = start
+        + seen[start..]
+            .iter()
+            .position(|line| line == ".")
+            .expect("end of DATA");
+    seen[start..end]
+        .iter()
+        .filter(|line| {
+            !line.starts_with(&format!(
+                "{}:",
+                camelmailer_core::bounce::MESSAGE_TOKEN_HEADER
+            ))
+        })
+        .cloned()
+        .collect()
+}
+
+fn tracking_worker_config(relay_port: u16) -> camelmailer_config::Config {
+    let mut config = worker_config(relay_port);
+    config.camelmailer.web_protocol = "https".into();
+    config.dns.track_domain = "track.example.com".into();
+    config
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tracking_off_leaves_html_mail_byte_identical() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    // a freshly created server has both flags off
+    assert!(!s.server.track_opens);
+    assert!(!s.server.track_clicks);
+
+    let submitted = html_outgoing(s.server.id);
+    let message_id = s.sink.insert_message(&submitted).await.unwrap();
+
+    let worker = Worker::new(&tracking_worker_config(smtp.port), s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+
+    let expected: Vec<String> = String::from_utf8(submitted.raw_message)
+        .unwrap()
+        .trim_end_matches("\r\n")
+        .split("\r\n")
+        .map(str::to_string)
+        .collect();
+    assert_eq!(delivered_data_lines(&smtp), expected);
+
+    assert_eq!(tracking_token_counts(&s, message_id).await, (0, 0));
+    let (clicks, opens) = s
+        .sink
+        .activity_counts(s.server.id, message_id)
+        .await
+        .unwrap();
+    assert_eq!(clicks, 0);
+    assert_eq!(opens, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn click_tracking_only_rewrites_links_without_a_pixel() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    set_tracking(&s, false, true).await;
+
+    let message_id = s
+        .sink
+        .insert_message(&html_outgoing(s.server.id))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&tracking_worker_config(smtp.port), s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+
+    let body = delivered_data_lines(&smtp).join("\n");
+    assert!(body.contains("https://track.example.com/track/c/"));
+    assert!(!body.contains("href=\"https://example.com/offer\""));
+    assert!(body.contains("href=\"mailto:x@y.z\""));
+    assert!(!body.contains("/track/o/"));
+    assert!(!body.contains(".gif"));
+
+    assert_eq!(tracking_token_counts(&s, message_id).await, (1, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_tracking_only_injects_a_pixel_without_rewriting_links() {
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let s = setup(pool).await;
+    let smtp = mock_smtp("250 Accepted").await;
+    set_tracking(&s, true, false).await;
+
+    let message_id = s
+        .sink
+        .insert_message(&html_outgoing(s.server.id))
+        .await
+        .unwrap();
+
+    let worker = Worker::new(&tracking_worker_config(smtp.port), s.store.clone());
+    worker.process_next().await.unwrap().unwrap();
+
+    let body = delivered_data_lines(&smtp).join("\n");
+    assert!(body.contains("https://track.example.com/track/o/"));
+    assert!(body.contains(".gif"));
+    assert!(body.contains("href=\"https://example.com/offer\""));
+    assert!(body.contains("href=\"mailto:x@y.z\""));
+    assert!(!body.contains("/track/c/"));
+
+    assert_eq!(tracking_token_counts(&s, message_id).await, (0, 1));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
     use axum::body::Body;
@@ -2527,6 +2672,7 @@ async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
         })
         .await
         .unwrap();
+    set_tracking(&s, true, true).await;
 
     let message_id = s
         .sink
@@ -2534,10 +2680,7 @@ async fn html_outgoing_mail_gets_click_links_rewritten_and_an_open_pixel() {
         .await
         .unwrap();
 
-    let mut config = worker_config(smtp.port);
-    config.camelmailer.web_protocol = "https".into();
-    config.dns.track_domain = "track.example.com".into();
-    let worker = Worker::new(&config, s.store.clone());
+    let worker = Worker::new(&tracking_worker_config(smtp.port), s.store.clone());
     worker.process_next().await.unwrap().unwrap();
 
     // the mock SMTP body carries the rewritten click link and the pixel
@@ -2637,6 +2780,8 @@ async fn signed_html_mail_is_not_rewritten_for_tracking() {
     let pool = test_pool(&base).await;
     let s = setup(pool).await;
     let smtp = mock_smtp("250 Accepted").await;
+    // tracking on, so the signature guard (not the flags) is under test
+    set_tracking(&s, true, true).await;
 
     // An inline-PGP-signed HTML body: top-level text/html (so it would
     // normally be tracked), but a rewrite would break the signature.

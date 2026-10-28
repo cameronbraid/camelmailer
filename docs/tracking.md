@@ -14,8 +14,10 @@ send time so the numbers roll up into message detail, per-server
    302-redirects the recipient to the original URL, which is preserved
    exactly.
 
-Tracking touches the **HTML part only**. A text-only message keeps its
-body verbatim and produces no open or click events.
+Both are **off by default** and enabled per mail server (see
+[Turning tracking on](#turning-tracking-on)). Tracking touches the **HTML
+part only**. A text-only message keeps its body verbatim and produces no
+open or click events.
 
 The HTML part is the first `text/html` part that is not an attachment,
 wherever it sits in the MIME tree (a single-part message, or inside
@@ -39,34 +41,43 @@ or US-ASCII is not tracked rather than risk garbling it.
 ## Turning tracking on
 
 Tracking is configured **per mail server**. A server carries two
-booleans, `track_opens` and `track_clicks`, the defaults for mail it
-sends over the HTTP API. Read them on the server record and set them
-through the management API:
+booleans, `track_opens` and `track_clicks`, and the delivery worker reads
+them for every outgoing message of that server, whether it was submitted
+over the HTTP API or SMTP. A newly created server has **both set to
+`false`**, so it sends untracked mail until you turn them on. Read them on
+the server record and set them through the management API:
 
 ```bash
 # inspect current settings
 curl -s "$API/api/v2/admin/organizations/acme/servers/production" \
   -H "X-Admin-API-Key: $ADMIN_KEY"
-#   … "track_opens": true, "track_clicks": true …
+#   … "track_opens": false, "track_clicks": false …
 
-# change them
+# turn both on
 curl -s -X PATCH "$API/api/v2/admin/organizations/acme/servers/production" \
   -H "X-Admin-API-Key: $ADMIN_KEY" -H "Content-Type: application/json" \
-  -d '{"track_opens": false, "track_clicks": false}'
+  -d '{"track_opens": true, "track_clicks": true}'
 ```
 
 The dashboard exposes the same two toggles on the server settings page.
 There is one granularity here: the mail server. Individual messages and
 [streams](streams.md) inherit the server's setting.
 
-> **Honest note on the current build.** The two flags are stored and
-> editable, and they surface everywhere a server is shown. The delivery
-> worker's tracking pass, however, rewrites the HTML of **every**
-> outgoing message that has an HTML part, without yet reading these
-> per-server flags. Treat the toggles as the intended control surface and
-> verify behaviour against your own installation before relying on them
-> to suppress tracking. To be certain a message carries no tracking
-> today, send it as text only, or run the server in privacy mode (below).
+The two flags are independent:
+
+| `track_opens` | `track_clicks` | What the worker does to an HTML message |
+|---|---|---|
+| `false` | `false` | Nothing. The message goes out exactly as stored, and no tracking tokens are created. |
+| `true` | `false` | Injects the open pixel and creates one open token. Links are left as written. |
+| `false` | `true` | Rewrites `http(s)` links and creates a link and click token for each. No pixel. |
+| `true` | `true` | Both. |
+
+The flags are read when the worker delivers the message, so a change
+applies to mail still in the queue as well as to new mail. If the worker
+cannot look up the server, it delivers the message without tracking and
+logs a warning rather than failing the delivery. A signed message
+(S/MIME, PGP/MIME or inline PGP) is never rewritten, whatever the flags
+say, because a rewrite would break its signature.
 
 ## The tracking domain
 
@@ -147,13 +158,13 @@ pass that rewrites the body and before DKIM signing (so the signature
 covers the final, rewritten message). For each outgoing HTML message the
 worker:
 
-1. Finds every `href="http(s)://…"` in the HTML body.
+1. With `track_clicks` on, finds every `href="http(s)://…"` in the HTML body.
 2. For each such link, stores a row in the `links` table, then generates
    a 24-character click token and inserts it into `tracking_tokens` with
    `kind = 'click'`, the `server_id`, `message_id`, `link_id` and the
    original `target_url`.
 3. Replaces the link with `<track_domain>/track/c/<token>`.
-4. Generates one open token (`kind = 'open'`, `server_id`, `message_id`,
+4. With `track_opens` on, generates one open token (`kind = 'open'`, `server_id`, `message_id`,
    no link or URL) and injects the pixel `<track_domain>/track/o/<token>.gif`
    before `</body>`.
 
@@ -179,8 +190,8 @@ Take this HTML message body:
 </html>
 ```
 
-With `track_domain = track.example.com`, the worker delivers this
-instead:
+With `track_domain = track.example.com` and both flags on, the worker
+delivers this instead:
 
 ```html
 <html>
@@ -246,9 +257,10 @@ Open and click tracking record the recipient's IP address and
 User-Agent. For an EU-focused deployment, weigh that against your legal
 basis and disclosures before enabling it. Several controls help:
 
-- **Disable per server.** Set `track_opens` and `track_clicks` to
-  `false` on the mail server (see the honest note above about the current
-  worker behaviour).
+- **Leave it off, or disable it per server.** New servers have
+  `track_opens` and `track_clicks` set to `false`. With both `false` the
+  worker sends the message unchanged and records nothing; either flag can
+  also be turned off on its own.
 - **Send text only.** A message with a text body and no HTML part is
   never rewritten and produces no events.
 - **Privacy mode.** A server in `privacy_mode` does not retain message
@@ -262,6 +274,8 @@ basis and disclosures before enabling it. Several controls help:
 
 Tracking events depend on two things that a laptop stack usually lacks:
 
+- **The server flags.** Nothing is rewritten unless `track_opens` or
+  `track_clicks` is on for the sending server.
 - **The delivery worker.** The rewrite and token registration happen only
   when the worker actually processes and sends a queued message. If the
   worker is not running, or the message never leaves the queue, no

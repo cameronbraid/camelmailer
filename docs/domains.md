@@ -77,7 +77,7 @@ something like `camelmailer` and the record becomes
 ### Which key signs
 
 Signing happens at **delivery time** in the worker, once the final body
-is assembled (after the click-tracking rewrites and the open pixel), so
+is assembled (after any click-tracking rewrites and open pixel), so
 the signature covers exactly what the recipient receives. The stored copy
 of the message stays unsigned.
 

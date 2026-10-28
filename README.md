@@ -224,8 +224,9 @@ unchanged (`postal:` group alias, `POSTAL_CONFIG_FILE_PATH`).
   key and the `dns.dkim_identifier` selector; the stored copy stays unsigned.
 - **Inspection.** Incoming mail is scored by rspamd and scanned by ClamAV
   (both opt-in); a virus hit or a spam-failure score holds the message.
-- **Tracking.** HTML links in outgoing mail are rewritten to
-  `/track/c/<token>` redirects and an open pixel is injected; the public,
+- **Tracking.** Per server and off by default: with `track_clicks` on,
+  HTML links in outgoing mail are rewritten to `/track/c/<token>`
+  redirects; with `track_opens` on, an open pixel is injected; the public,
   unauthenticated tracking endpoints resolve tokens and record clicks/opens
   into the RLS-protected tables.
 - **Webhooks.** Events are queued, delivered with retries and exponential

@@ -297,8 +297,9 @@ impl Worker {
             });
         }
 
-        // Rewrite HTML links for click tracking and append an open pixel
-        // before signing, so the DKIM signature covers the final body.
+        // Rewrite HTML links for click tracking and append an open pixel, as
+        // far as the server's track_clicks / track_opens flags allow, before
+        // signing, so the DKIM signature covers the final body.
         let tracked = self.apply_tracking(message).await?;
 
         // DKIM-sign at delivery time when the message carries an
@@ -914,13 +915,42 @@ impl Worker {
     }
 
     /// Register tracking tokens and rewrite the HTML body of an outgoing
-    /// message. No-op for non-HTML messages. Returns the (possibly
-    /// rewritten) raw message.
+    /// message, as far as the server's `track_opens` / `track_clicks` flags
+    /// ask for. No-op for non-HTML messages and for servers with both flags
+    /// off. Returns the (possibly rewritten) raw message.
     async fn apply_tracking(&self, message: &StoredMessage) -> Result<Vec<u8>, sqlx::Error> {
         // Never rewrite a cryptographically signed message: injecting the open
         // pixel or rewriting a link would invalidate an S/MIME, PGP/MIME or
         // inline-PGP signature over the body.
         if tracking::is_signed(&message.raw_message) {
+            return Ok(message.raw_message.clone());
+        }
+
+        // The per-server flags decide what is tracked. A lookup failure or a
+        // missing server tracks nothing (fail closed, for the recipient's
+        // privacy) and does not hold up the delivery.
+        let server = match self.store.server_async(message.server_id).await {
+            Ok(Some(server)) => Some(server),
+            Ok(None) => {
+                tracing::warn!(
+                    message_id = message.id,
+                    server_id = message.server_id,
+                    "server not found; delivering without open/click tracking"
+                );
+                None
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    message_id = message.id,
+                    server_id = message.server_id,
+                    "server lookup failed; delivering without open/click tracking"
+                );
+                None
+            }
+        };
+        let flags = tracking::TrackingFlags::for_server(server.as_ref());
+        if !flags.any() {
             return Ok(message.raw_message.clone());
         }
 
@@ -941,42 +971,47 @@ impl Worker {
                 .map(|host| format!("{}://{host}", self.web_protocol))
                 .unwrap_or_else(|| self.tracking_base_url.clone());
 
-        // register a link + click token for every rewritten URL
-        let mut pending_links: Vec<String> = Vec::new();
-        let (rewritten, urls) = tracking::rewrite_links(&body, |url| {
-            pending_links.push(url.to_string());
-            format!("__CM_CLICK_{}__", pending_links.len() - 1)
-        });
-        let _ = urls;
+        let mut rewritten = body;
 
-        let mut click_tokens = Vec::with_capacity(pending_links.len());
-        for url in &pending_links {
-            let (link_id, _) = self
-                .sink
-                .create_link(message.server_id, message.id, url)
-                .await?;
-            let token = self
+        // click tracking: register a link + click token for every rewritten URL
+        if flags.clicks {
+            let mut pending_links: Vec<String> = Vec::new();
+            let (with_placeholders, _) = tracking::rewrite_links(&rewritten, |url| {
+                pending_links.push(url.to_string());
+                format!("__CM_CLICK_{}__", pending_links.len() - 1)
+            });
+            rewritten = with_placeholders;
+
+            let mut click_tokens = Vec::with_capacity(pending_links.len());
+            for url in &pending_links {
+                let (link_id, _) = self
+                    .sink
+                    .create_link(message.server_id, message.id, url)
+                    .await?;
+                let token = self
+                    .store
+                    .create_click_token(message.server_id, message.id, link_id, url)
+                    .await?;
+                click_tokens.push(token);
+            }
+
+            for (index, token) in click_tokens.iter().enumerate() {
+                rewritten = rewritten.replace(
+                    &format!("__CM_CLICK_{index}__"),
+                    &format!("{tracking_base_url}/track/c/{token}"),
+                );
+            }
+        }
+
+        // open tracking: one open token and the pixel
+        if flags.opens {
+            let open_token = self
                 .store
-                .create_click_token(message.server_id, message.id, link_id, url)
+                .create_open_token(message.server_id, message.id)
                 .await?;
-            click_tokens.push(token);
+            let pixel_url = format!("{tracking_base_url}/track/o/{open_token}.gif");
+            rewritten = tracking::inject_open_pixel(&rewritten, &pixel_url);
         }
-
-        let mut rewritten = rewritten;
-        for (index, token) in click_tokens.iter().enumerate() {
-            rewritten = rewritten.replace(
-                &format!("__CM_CLICK_{index}__"),
-                &format!("{tracking_base_url}/track/c/{token}"),
-            );
-        }
-
-        // open-tracking pixel
-        let open_token = self
-            .store
-            .create_open_token(message.server_id, message.id)
-            .await?;
-        let pixel_url = format!("{tracking_base_url}/track/o/{open_token}.gif");
-        let rewritten = tracking::inject_open_pixel(&rewritten, &pixel_url);
 
         Ok(tracking::with_html(&message.raw_message, &rewritten)
             .unwrap_or_else(|| message.raw_message.clone()))

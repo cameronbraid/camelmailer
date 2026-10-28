@@ -37,9 +37,11 @@ pub struct Server {
     pub allow_sender: bool,
     /// IP pool to source outbound mail from (None = system default).
     pub ip_pool_id: Option<Id>,
-    /// Default open-tracking for mail sent via the HTTP API.
+    /// Inject an open-tracking pixel into this server's outgoing HTML mail
+    /// (applied by the delivery worker; off for new servers).
     pub track_opens: bool,
-    /// Default click-tracking for mail sent via the HTTP API.
+    /// Rewrite links in this server's outgoing HTML mail for click tracking
+    /// (applied by the delivery worker; off for new servers).
     pub track_clicks: bool,
     /// Outgoing messages this server may store in the trailing 30-day
     /// window. `None` is unlimited, which is every server until an operator

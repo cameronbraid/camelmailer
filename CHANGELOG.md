@@ -15,6 +15,25 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Per-server tracking flags are honoured.** The delivery worker rewrote
+  links and injected an open pixel into every outgoing HTML message,
+  ignoring the server's `track_opens` and `track_clicks` settings. It now
+  reads them for each delivery: `track_clicks` alone rewrites links and
+  creates click tokens, `track_opens` alone injects the pixel and creates
+  an open token, and with both off the message goes out unchanged with no
+  tracking tokens. If the server cannot be looked up, the message is
+  delivered untracked and a warning is logged. Signed messages are still
+  never rewritten.
+
+  **Behaviour change:** new servers have always defaulted to both flags
+  off, so any server that relied on the old always-on tracking stops
+  recording opens and clicks after this upgrade. Turn the flags on
+  (`PATCH /api/v2/admin/organizations/{org}/servers/{server}` with
+  `{"track_opens": true, "track_clicks": true}`, or the dashboard's server
+  settings) to keep tracking.
+
 ## [0.9.1] - 2026-10-23
 
 ### Fixed
