@@ -15,6 +15,16 @@ integration tests) is green.
 
 ## [Unreleased]
 
+### Added
+
+- **Worker pools per server.** `worker.servers` limits a worker to the
+  listed `organization/server` permalinks and `worker.exclude_servers`
+  makes it skip them, for both the message and webhook queues. A bulk
+  server can then get its own workers, and its backlog no longer delays
+  transactional mail from other servers. Unknown permalinks stop the
+  worker at startup. No schema change: the filter is applied to the
+  existing dequeue queries.
+
 ## [0.9.1] - 2026-10-23
 
 ### Fixed

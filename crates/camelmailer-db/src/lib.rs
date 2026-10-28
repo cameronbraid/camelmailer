@@ -24,7 +24,7 @@ pub use pg_store::{
     BounceCorrelationOutcome, BounceOriginal, Delivery, FeedbackComplaint,
     FeedbackComplaintOutcome, OutboundQueueAction, PgMessageSink, PgStore, StoredMessage,
 };
-pub use queue::{PgQueue, QueuedMessageRow};
+pub use queue::{PgQueue, QueuedMessageRow, ServerFilter};
 pub use webhook_queue::{PgWebhookQueue, WebhookLogEntry, WebhookRequestRow};
 
 use sqlx::postgres::PgPoolOptions;

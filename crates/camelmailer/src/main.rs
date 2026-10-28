@@ -329,7 +329,11 @@ async fn worker() -> std::io::Result<()> {
         ));
     }
     let store = connect_pg(&config).await?;
+    let server_filter = camelmailer_worker::resolve_server_filter(&store, &config.worker)
+        .await
+        .map_err(std::io::Error::other)?;
     Worker::new(&config, store)
+        .with_server_filter(server_filter)
         .run()
         .await
         .map_err(std::io::Error::other)

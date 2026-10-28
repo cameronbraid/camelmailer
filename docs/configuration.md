@@ -290,3 +290,32 @@ camelmailer worker        # delivery; scale by queue depth (SKIP LOCKED —
                           # any number of workers cooperate safely)
 camelmailer initialize    # one-shot migrations (idempotent, run per deploy)
 ```
+
+### Worker pools per server
+
+Every server shares one delivery queue, delivered oldest first, so a large
+send on one server delays every other server's mail behind it. To keep
+servers apart, run a separate pool of workers for each, selected with
+`organization/server` permalinks:
+
+```yaml
+# workers for the bulk server only
+worker:
+  servers:
+    - acme/bulk
+```
+
+```yaml
+# workers for everything else
+worker:
+  exclude_servers:
+    - acme/bulk
+```
+
+The selection applies to both the message queue and the webhook queue. A
+worker sets `servers` or `exclude_servers`, not both. Permalinks are
+resolved when the worker starts: one that names no server stops the worker
+with an error rather than silently matching nothing, and a server created
+later is picked up by excluding workers but needs a restart to be added to
+a `servers` list. Make sure the pools between them cover every server, or
+the uncovered servers' mail is never delivered.

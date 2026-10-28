@@ -19,7 +19,7 @@ use camelmailer_db::webhook_payload::{
 };
 use camelmailer_db::{
     BounceCorrelationOutcome, BounceOriginal, FeedbackComplaintOutcome, OutboundQueueAction,
-    PgMessageSink, PgQueue, PgStore, PgWebhookQueue, StoredMessage,
+    PgMessageSink, PgQueue, PgStore, PgWebhookQueue, ServerFilter, StoredMessage,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -148,6 +148,8 @@ pub struct Worker {
     /// Validated shared SMTP return-path domain. Invalid placeholders retain
     /// the submitted envelope sender.
     return_path_domain: Option<String>,
+    /// Which servers' messages and webhooks this worker takes.
+    server_filter: ServerFilter,
     worker_id: String,
 }
 
@@ -209,8 +211,18 @@ impl Worker {
             max_attempts: config.camelmailer.default_maximum_delivery_attempts as i32,
             message_retention_days: config.camelmailer.message_retention_days as i64,
             return_path_domain,
+            server_filter: ServerFilter::All,
             worker_id: format!("worker-{}", camelmailer_core::token::generate_token(6)),
         }
+    }
+
+    /// Take only the messages and webhooks of the servers selected by
+    /// `filter` (see [`crate::resolve_server_filter`]).
+    pub fn with_server_filter(mut self, filter: ServerFilter) -> Self {
+        self.queue = self.queue.with_server_filter(filter.clone());
+        self.webhook_queue = self.webhook_queue.with_server_filter(filter.clone());
+        self.server_filter = filter;
+        self
     }
 
     /// Process one queued message, if any is ready. Returns `None` when the
@@ -1161,7 +1173,11 @@ impl Worker {
     /// The long-running worker loop: drain the queue, then poll. Runs
     /// housekeeping once at startup and then hourly.
     pub async fn run(&self) -> Result<(), sqlx::Error> {
-        tracing::info!(worker_id = %self.worker_id, "camelmailer worker started");
+        tracing::info!(
+            worker_id = %self.worker_id,
+            servers = ?self.server_filter,
+            "camelmailer worker started"
+        );
         let mut last_housekeeping: Option<std::time::Instant> = None;
         loop {
             if last_housekeeping.is_none_or(|at| at.elapsed() >= HOUSEKEEPING_INTERVAL) {

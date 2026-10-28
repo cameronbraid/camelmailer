@@ -5,6 +5,11 @@
 //! *content* is only ever loaded by entering the owning server's RLS tenant
 //! context. Locking uses `FOR UPDATE SKIP LOCKED` so multiple workers can
 //! dequeue concurrently without stepping on each other.
+//!
+//! A worker can be limited to, or kept away from, particular tenant servers
+//! with a [`ServerFilter`]. One installation can then run a separate worker
+//! pool per server, so a bulk send on one server cannot hold up delivery for
+//! another.
 
 use camelmailer_core::Id;
 use sqlx::postgres::PgRow;
@@ -26,6 +31,40 @@ fn queued_from_row(row: &PgRow) -> QueuedMessageRow {
         server_id: row.get::<i64, _>("server_id") as Id,
         domain: row.get("domain"),
         attempts: row.get("attempts"),
+    }
+}
+
+/// Which tenant servers' rows a worker takes from the shared queues.
+///
+/// The queues stay cross-tenant; the filter only narrows what one worker
+/// dequeues. Every row still belongs to exactly one server, so a set of
+/// workers that together cover all servers still delivers everything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ServerFilter {
+    /// Every server (the default).
+    #[default]
+    All,
+    /// Only these servers.
+    Only(Vec<Id>),
+    /// Every server except these.
+    Except(Vec<Id>),
+}
+
+impl ServerFilter {
+    /// The `$n::bigint[]` bind for `server_id = ANY(...)`; `None` matches all.
+    pub(crate) fn only_ids(&self) -> Option<Vec<i64>> {
+        match self {
+            ServerFilter::Only(ids) => Some(ids.iter().map(|id| *id as i64).collect()),
+            _ => None,
+        }
+    }
+
+    /// The `$n::bigint[]` bind for `server_id <> ALL(...)`; `None` excludes none.
+    pub(crate) fn except_ids(&self) -> Option<Vec<i64>> {
+        match self {
+            ServerFilter::Except(ids) => Some(ids.iter().map(|id| *id as i64).collect()),
+            _ => None,
+        }
     }
 }
 
@@ -87,6 +126,7 @@ pub struct PgQueue {
     /// A message locked (`locked_by` set) longer ago than this is treated as
     /// abandoned by a crashed worker and re-dequeued.
     stale_lock_days: i32,
+    server_filter: ServerFilter,
 }
 
 impl PgQueue {
@@ -94,6 +134,7 @@ impl PgQueue {
         Self {
             pool,
             stale_lock_days: DEFAULT_STALE_LOCK_DAYS,
+            server_filter: ServerFilter::All,
         }
     }
 
@@ -105,7 +146,14 @@ impl PgQueue {
         Self {
             pool,
             stale_lock_days: stale_lock_days.max(1),
+            server_filter: ServerFilter::All,
         }
+    }
+
+    /// Limit [`PgQueue::dequeue`] to the servers selected by `filter`.
+    pub fn with_server_filter(mut self, filter: ServerFilter) -> Self {
+        self.server_filter = filter;
+        self
     }
 
     pub async fn enqueue(
@@ -126,7 +174,8 @@ impl PgQueue {
         Ok(row.get("id"))
     }
 
-    /// Lock and return the next ready queued message, if any.
+    /// Lock and return the next ready queued message, if any, from the
+    /// servers selected by this queue's [`ServerFilter`].
     ///
     /// A row is ready when it is unlocked, *or* when its lock is stale — held
     /// since before `now() - queued_message_lock_stale_days`, i.e. by a worker
@@ -140,6 +189,8 @@ impl PgQueue {
                  WHERE (locked_by IS NULL
                         OR locked_at < now() - make_interval(days => $2::int))
                    AND (retry_after IS NULL OR retry_after <= now())
+                   AND ($3::bigint[] IS NULL OR server_id = ANY($3))
+                   AND ($4::bigint[] IS NULL OR server_id <> ALL($4))
                  ORDER BY id
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
@@ -148,6 +199,8 @@ impl PgQueue {
         )
         .bind(worker_id)
         .bind(self.stale_lock_days)
+        .bind(self.server_filter.only_ids())
+        .bind(self.server_filter.except_ids())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.as_ref().map(queued_from_row))

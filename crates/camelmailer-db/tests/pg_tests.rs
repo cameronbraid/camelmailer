@@ -2670,6 +2670,139 @@ async fn dequeue_reclaims_stale_locks_but_not_fresh_ones() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dequeue_honours_the_worker_server_filter() {
+    use camelmailer_db::{PgQueue, ServerFilter};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let bulk = f.server.id;
+    let transact = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Transact".into(),
+            permalink: "transact".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap()
+        .id;
+
+    // A bulk backlog queued ahead of one transactional message.
+    let queue = PgQueue::new(pool.clone());
+    let mut bulk_rows = vec![];
+    for n in 0..3 {
+        bulk_rows.push(queue.enqueue(2000 + n, bulk, "bulk.example").await.unwrap());
+    }
+    let transact_row = queue
+        .enqueue(3000, transact, "transact.example")
+        .await
+        .unwrap();
+
+    // A worker excluding bulk goes straight to the transactional message.
+    let general = PgQueue::new(pool.clone()).with_server_filter(ServerFilter::Except(vec![bulk]));
+    let taken = general.dequeue("general").await.unwrap().unwrap();
+    assert_eq!((taken.id, taken.server_id), (transact_row, transact));
+    assert!(general.dequeue("general").await.unwrap().is_none());
+
+    // A bulk-only worker drains the bulk backlog, in order, and nothing else.
+    let bulk_worker = PgQueue::new(pool.clone()).with_server_filter(ServerFilter::Only(vec![bulk]));
+    for expected in &bulk_rows {
+        let taken = bulk_worker.dequeue("bulk").await.unwrap().unwrap();
+        assert_eq!((taken.id, taken.server_id), (*expected, bulk));
+    }
+    assert!(bulk_worker.dequeue("bulk").await.unwrap().is_none());
+
+    // The unfiltered default still takes every server's rows.
+    queue.clear_backoff().await.unwrap();
+    let mut seen = vec![];
+    while let Some(row) = queue.dequeue("any").await.unwrap() {
+        seen.push(row.server_id);
+    }
+    assert_eq!(seen, vec![bulk, bulk, bulk, transact]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn webhook_dequeue_honours_the_worker_server_filter() {
+    use camelmailer_db::{PgWebhookQueue, ServerFilter};
+
+    let base = require_db!();
+    let pool = test_pool(&base).await;
+    let f = fixtures(pool.clone()).await;
+    let bulk = f.server.id;
+    let transact = f
+        .store
+        .create_server(NewServer {
+            organization_id: f.organization.id,
+            name: "Transact".into(),
+            permalink: "transact".into(),
+            mode: ServerMode::Live,
+        })
+        .await
+        .unwrap()
+        .id;
+    let mut hooks = vec![];
+    for server_id in [bulk, transact] {
+        let hook = f
+            .store
+            .create_webhook(camelmailer_core::NewWebhook::all(
+                server_id,
+                "hook",
+                "https://hooks.example/cb",
+                false,
+            ))
+            .await
+            .unwrap();
+        hooks.push(hook.id);
+    }
+    let queue = PgWebhookQueue::new(pool.clone());
+    let headers = std::collections::BTreeMap::new();
+    let bulk_request = queue
+        .enqueue(
+            bulk,
+            hooks[0],
+            "u-bulk",
+            "MessageSent",
+            "https://hooks.example/cb",
+            "{}",
+            false,
+            &headers,
+        )
+        .await
+        .unwrap();
+    let transact_request = queue
+        .enqueue(
+            transact,
+            hooks[1],
+            "u-transact",
+            "MessageSent",
+            "https://hooks.example/cb",
+            "{}",
+            false,
+            &headers,
+        )
+        .await
+        .unwrap();
+
+    let general =
+        PgWebhookQueue::new(pool.clone()).with_server_filter(ServerFilter::Except(vec![bulk]));
+    assert_eq!(
+        general.dequeue("general").await.unwrap().unwrap().id,
+        transact_request
+    );
+    assert!(general.dequeue("general").await.unwrap().is_none());
+
+    let bulk_worker =
+        PgWebhookQueue::new(pool.clone()).with_server_filter(ServerFilter::Only(vec![bulk]));
+    assert_eq!(
+        bulk_worker.dequeue("bulk").await.unwrap().unwrap().id,
+        bulk_request
+    );
+    assert!(bulk_worker.dequeue("bulk").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn templates_crud_and_scoping() {
     use camelmailer_core::{NewTemplate, ServerStore};
 

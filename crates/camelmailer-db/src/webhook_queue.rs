@@ -1,6 +1,7 @@
 //! Webhook delivery queue + tenant-scoped audit log.
 
 use crate::pg_store::set_tenant_context;
+use crate::queue::ServerFilter;
 use camelmailer_core::Id;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -70,6 +71,7 @@ pub struct PgWebhookQueue {
     /// A request locked (`locked_by` set) longer ago than this is treated as
     /// abandoned by a crashed worker and re-dequeued.
     stale_lock_days: i32,
+    server_filter: ServerFilter,
 }
 
 impl PgWebhookQueue {
@@ -77,6 +79,7 @@ impl PgWebhookQueue {
         Self {
             pool,
             stale_lock_days: DEFAULT_STALE_LOCK_DAYS,
+            server_filter: ServerFilter::All,
         }
     }
 
@@ -87,7 +90,14 @@ impl PgWebhookQueue {
         Self {
             pool,
             stale_lock_days: stale_lock_days.max(1),
+            server_filter: ServerFilter::All,
         }
+    }
+
+    /// Limit [`PgWebhookQueue::dequeue`] to the servers selected by `filter`.
+    pub fn with_server_filter(mut self, filter: ServerFilter) -> Self {
+        self.server_filter = filter;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -121,7 +131,8 @@ impl PgWebhookQueue {
         Ok(row.get("id"))
     }
 
-    /// Lock and return the next ready webhook request, if any. Reclaims stale
+    /// Lock and return the next ready webhook request, if any, from the
+    /// servers selected by this queue's [`ServerFilter`]. Reclaims stale
     /// locks (held since before `now() - queued_message_lock_stale_days`) so a
     /// crash mid-delivery does not strand a request permanently.
     pub async fn dequeue(&self, worker_id: &str) -> Result<Option<WebhookRequestRow>, sqlx::Error> {
@@ -132,6 +143,8 @@ impl PgWebhookQueue {
                  WHERE (locked_by IS NULL
                         OR locked_at < now() - make_interval(days => $2::int))
                    AND (retry_after IS NULL OR retry_after <= now())
+                   AND ($3::bigint[] IS NULL OR server_id = ANY($3))
+                   AND ($4::bigint[] IS NULL OR server_id <> ALL($4))
                  ORDER BY id
                  LIMIT 1
                  FOR UPDATE SKIP LOCKED
@@ -140,6 +153,8 @@ impl PgWebhookQueue {
         )
         .bind(worker_id)
         .bind(self.stale_lock_days)
+        .bind(self.server_filter.only_ids())
+        .bind(self.server_filter.except_ids())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.as_ref().map(request_from_row))

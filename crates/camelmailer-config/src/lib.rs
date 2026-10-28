@@ -461,6 +461,12 @@ pub struct Worker {
     pub default_health_server_port: u16,
     pub default_health_server_bind_address: String,
     pub threads: u32,
+    /// Deliver only these servers' messages and webhooks, as
+    /// `organization/server` permalinks. Empty means every server.
+    pub servers: Vec<String>,
+    /// Deliver every server's messages and webhooks except these, as
+    /// `organization/server` permalinks. Cannot be combined with `servers`.
+    pub exclude_servers: Vec<String>,
 }
 
 impl Default for Worker {
@@ -469,8 +475,18 @@ impl Default for Worker {
             default_health_server_port: 9090,
             default_health_server_bind_address: "127.0.0.1".into(),
             threads: 2,
+            servers: vec![],
+            exclude_servers: vec![],
         }
     }
+}
+
+/// Split an `organization/server` permalink pair, as used by
+/// `worker.servers` and `worker.exclude_servers`.
+pub fn parse_server_permalink(value: &str) -> Option<(&str, &str)> {
+    let (organization, server) = value.split_once('/')?;
+    let valid = |part: &str| !part.is_empty() && !part.contains('/') && part.trim() == part;
+    (valid(organization) && valid(server)).then_some((organization, server))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -993,6 +1009,25 @@ impl Config {
                 return Err(ConfigError::Invalid(
                     "smtp_server.log_ip_address_exclusion_matcher must not be empty".into(),
                 ));
+            }
+        }
+        if !self.worker.servers.is_empty() && !self.worker.exclude_servers.is_empty() {
+            return Err(ConfigError::Invalid(
+                "worker.servers and worker.exclude_servers cannot both be set; \
+                 run separate workers for each selection"
+                    .into(),
+            ));
+        }
+        for (key, entries) in [
+            ("worker.servers", &self.worker.servers),
+            ("worker.exclude_servers", &self.worker.exclude_servers),
+        ] {
+            for entry in entries {
+                if parse_server_permalink(entry).is_none() {
+                    return Err(ConfigError::Invalid(format!(
+                        "{key}: {entry:?} must be an organization/server permalink pair"
+                    )));
+                }
             }
         }
         let mut seen_ports = vec![self.smtp_server.default_port];
@@ -1711,6 +1746,60 @@ auth:
         assert!(!config.smtp_server.auth_requires_tls);
         // A migration window is a valid configuration, not a config error.
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn worker_server_selection_defaults_to_every_server() {
+        let config = Config::default();
+        assert!(config.worker.servers.is_empty());
+        assert!(config.worker.exclude_servers.is_empty());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn worker_server_selection_parses_from_yaml() {
+        let only = Config::from_yaml("worker:\n  servers:\n    - drivenow/bulk\n").unwrap();
+        assert_eq!(only.worker.servers, vec!["drivenow/bulk".to_string()]);
+        only.validate().unwrap();
+
+        let except = Config::from_yaml(
+            "worker:\n  exclude_servers:\n    - drivenow/bulk\n    - drivenow/other\n",
+        )
+        .unwrap();
+        assert_eq!(except.worker.exclude_servers.len(), 2);
+        except.validate().unwrap();
+    }
+
+    #[test]
+    fn worker_servers_and_exclude_servers_are_exclusive() {
+        let config = Config::from_yaml(
+            "worker:\n  servers: [drivenow/bulk]\n  exclude_servers: [drivenow/transact]\n",
+        )
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("cannot both be set"), "{error}");
+    }
+
+    #[test]
+    fn worker_server_entries_must_be_permalink_pairs() {
+        for entry in ["bulk", "drivenow/", "/bulk", "a/b/c", " drivenow/bulk"] {
+            let mut config = Config::default();
+            config.worker.servers = vec![entry.to_string()];
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("worker.servers"), "{entry:?}: {error}");
+
+            let mut config = Config::default();
+            config.worker.exclude_servers = vec![entry.to_string()];
+            let error = config.validate().unwrap_err().to_string();
+            assert!(
+                error.contains("worker.exclude_servers"),
+                "{entry:?}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_server_permalink("drivenow/bulk"),
+            Some(("drivenow", "bulk"))
+        );
     }
 
     #[test]
